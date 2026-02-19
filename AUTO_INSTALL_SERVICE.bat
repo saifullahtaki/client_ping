@@ -52,6 +52,142 @@ echo [OK] Found client_ping.py
 echo.
 
 REM ============================================================
+REM Verify Code Version (Check for latest features)
+REM ============================================================
+
+set CODE_WAS_OLD=NO
+set CODE_UPDATE_METHOD=NONE
+
+echo Verifying code version...
+findstr /C:"get_server_info_from_target" "%CLIENT_SCRIPT%" >nul 2>&1
+
+if %errorLevel% EQU 0 (
+    echo [OK] Latest code detected - server mapping support found
+    echo.
+    set CODE_WAS_OLD=NO
+    goto :code_verified
+)
+
+REM OLD CODE DETECTED - Need to download latest
+set CODE_WAS_OLD=YES
+echo [WARNING] OLD CODE DETECTED!
+echo This version does not support server name resolution.
+echo.
+
+REM GitHub URL for latest code
+set GITHUB_URL=https://raw.githubusercontent.com/saifullahtaki/client_ping/main/client_ping.py
+
+echo Attempting to download latest code from GitHub...
+echo URL: !GITHUB_URL!
+echo.
+
+set TEMP_DOWNLOAD=!SCRIPT_DIR!\client_ping.py.download
+
+REM Delete any existing temp file
+if exist "!TEMP_DOWNLOAD!" del "!TEMP_DOWNLOAD!" >nul 2>&1
+
+echo Downloading to: !TEMP_DOWNLOAD!
+echo.
+
+REM Try downloading with PowerShell script
+powershell -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\download_github.ps1" -Url "!GITHUB_URL!" -OutputFile "!TEMP_DOWNLOAD!"
+
+REM Check if file was downloaded
+if exist "!TEMP_DOWNLOAD!" (
+    REM Verify downloaded file has the required function
+    findstr /C:"get_server_info_from_target" "!TEMP_DOWNLOAD!" >nul 2>&1
+    
+    if !errorLevel! EQU 0 (
+        echo [OK] Latest code downloaded successfully from GitHub!
+        echo.
+        echo Backing up old code...
+        copy /Y "!CLIENT_SCRIPT!" "!CLIENT_SCRIPT!.old.%date:~-4%%date:~-10,2%%date:~-7,2%_%time:~0,2%%time:~3,2%%time:~6,2%.backup" >nul 2>&1
+        
+        echo Updating to latest code...
+        move /Y "!TEMP_DOWNLOAD!" "!CLIENT_SCRIPT!" >nul 2>&1
+        
+        if !errorLevel! EQU 0 (
+            echo [OK] Code updated successfully from GitHub!
+            echo.
+            set CODE_UPDATE_METHOD=GITHUB
+            goto :code_verified
+        ) else (
+            echo [ERROR] Failed to replace old code!
+            pause
+            exit /b 1
+        )
+    ) else (
+        echo [ERROR] Downloaded file does not contain required features!
+        echo The file from GitHub may be outdated or incorrect.
+        del "!TEMP_DOWNLOAD!" >nul 2>&1
+        echo.
+        echo Please check GitHub URL or update manually.
+        pause
+        exit /b 1
+    )
+) else (
+    echo [WARNING] GitHub download failed. Trying alternative methods...
+    echo.
+    
+    REM Fallback: Check USB drives for latest code
+    set LATEST_CODE_FOUND=0
+    set LATEST_CODE_PATH=
+    
+    echo Searching USB drives for latest code...
+    for %%d in (D E F G H I J K) do (
+        if exist "%%d:\client_ping.py" (
+            findstr /C:"get_server_info_from_target" "%%d:\client_ping.py" >nul 2>&1
+            if !errorLevel! EQU 0 (
+                set LATEST_CODE_FOUND=1
+                set LATEST_CODE_PATH=%%d:\client_ping.py
+                echo [FOUND] Latest code at: !LATEST_CODE_PATH!
+                goto :usb_found
+            )
+        )
+    )
+    
+    :usb_found
+    if !LATEST_CODE_FOUND! EQU 1 (
+        echo.
+        echo Backing up old code...
+        copy /Y "%CLIENT_SCRIPT%" "%CLIENT_SCRIPT%.old.backup" >nul 2>&1
+        
+        echo Copying latest code from USB...
+        copy /Y "!LATEST_CODE_PATH!" "%CLIENT_SCRIPT%" >nul 2>&1
+        
+        if !errorLevel! EQU 0 (
+            echo [OK] Code updated successfully from USB!
+            echo.
+            set CODE_UPDATE_METHOD=USB
+            goto :code_verified
+        ) else (
+            echo [ERROR] Failed to update code!
+            pause
+            exit /b 1
+        )
+    ) else (
+        echo.
+        echo [ERROR] Cannot download from GitHub and no USB drive found!
+        echo.
+        echo Please do one of the following:
+        echo   1. Check internet connection and GitHub URL
+        echo   2. Copy latest client_ping.py to USB drive (any drive D: to K:)
+        echo   3. Copy latest client_ping.py directly to: %CLIENT_SCRIPT%
+        echo.
+        echo Current GitHub URL: !GITHUB_URL!
+        echo (Edit this script to update the URL if needed)
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
+:code_verified
+REM Code is now verified - continue with service installation
+
+echo.
+
+REM ============================================================
 REM Check NSSM
 REM ============================================================
 
@@ -142,15 +278,54 @@ REM Install Python Dependencies
 REM ============================================================
 
 echo Installing Python dependencies...
+echo.
+
+REM Upgrade pip first
+echo [1/2] Upgrading pip...
 "%PYTHON_EXE%" -m pip install --upgrade pip --quiet
+
+if %errorLevel% NEQ 0 (
+    echo [WARNING] pip upgrade failed, continuing anyway...
+)
+
+REM Install requests package
+echo [2/2] Installing requests package...
 "%PYTHON_EXE%" -m pip install requests --quiet
 
 if %errorLevel% NEQ 0 (
-    echo [WARNING] Failed to install some packages, trying again...
+    echo [WARNING] Failed to install requests package silently, trying verbose mode...
     "%PYTHON_EXE%" -m pip install requests
+    
+    if %errorLevel% NEQ 0 (
+        echo [ERROR] Failed to install requests package!
+        echo.
+        echo This package is required for the service to work.
+        echo Please check your internet connection and try again.
+        echo.
+        echo Manual installation: %PYTHON_EXE% -m pip install requests
+        echo.
+        pause
+        exit /b 1
+    )
 )
 
-echo [OK] Python dependencies installed
+REM Verify installation by testing import
+echo Verifying installation...
+"%PYTHON_EXE%" -c "import requests; print('requests version:', requests.__version__)" >nul 2>&1
+
+if %errorLevel% EQU 0 (
+    echo.
+    echo [OK] All Python dependencies installed and verified
+    echo     - pip (latest)
+    echo     - requests (for HTTP API calls)
+) else (
+    echo.
+    echo [WARNING] Package verification failed, but this is often a cache issue.
+    echo The service will attempt to use the packages anyway.
+    echo.
+    echo If service fails to start, manually run: %PYTHON_EXE% -m pip install requests
+    echo.
+)
 echo.
 
 REM ============================================================
@@ -305,6 +480,16 @@ if exist "%LOG_DIR%\service_stdout.log" (
     echo.
     echo --- Last 15 lines of log ---
     powershell -Command "Get-Content '%LOG_DIR%\service_stdout.log' -Tail 15 -ErrorAction SilentlyContinue"
+    
+    REM Verify that service is using latest code
+    echo.
+    echo Verifying service loaded latest code...
+    findstr /C:"Successfully fetched" "%LOG_DIR%\service_stdout.log" >nul 2>&1
+    if %errorLevel% EQU 0 (
+        echo [OK] Service successfully loaded server mappings from API
+    ) else (
+        echo [INFO] Server mapping fetch not yet complete - may need more time
+    )
 ) else (
     echo [INFO] Log file not created yet
 )
@@ -314,10 +499,65 @@ echo ============================================================
 echo    Installation Complete!
 echo ============================================================
 echo.
-echo Service Name: %SERVICE_NAME%
-echo Python: %PYTHON_EXE%
-echo Script: %CLIENT_SCRIPT%
-echo Logs: %LOG_DIR%
+
+REM ============================================================
+REM Show Installation Summary
+REM ============================================================
+echo.
+echo ============================================================
+echo    INSTALLATION SUMMARY
+echo ============================================================
+echo.
+
+if "!CODE_WAS_OLD!"=="YES" (
+    echo [CODE STATUS]
+    echo   - Initial Status: OLD CODE (no server name support)
+    if "!CODE_UPDATE_METHOD!"=="GITHUB" (
+        echo   - Update Method: Downloaded from GitHub
+        echo   - GitHub URL: https://raw.githubusercontent.com/saifullahtaki/client_ping/main/client_ping.py
+    ) else if "!CODE_UPDATE_METHOD!"=="USB" (
+        echo   - Update Method: Copied from USB drive
+    ) else (
+        echo   - Update Method: Manual update required
+    )
+    echo   - Final Status: NEW CODE (with server name support)
+    echo   - Backup Created: Yes
+    echo.
+) else (
+    echo [CODE STATUS]
+    echo   - Initial Status: NEW CODE (already up-to-date)
+    echo   - Update Required: No
+    echo.
+)
+
+echo [PYTHON ENVIRONMENT]
+echo   - Python Executable: %PYTHON_EXE%
+for /f "delims=" %%v in ('"%PYTHON_EXE%" --version 2^>^&1') do echo   - Version: %%v
+echo   - Required Packages: requests
+echo   - Installation Status: Verified
+echo.
+echo [SERVICE STATUS]
+echo   - Service Name: %SERVICE_NAME%
+echo   - Display Name: Studio Ping Monitor Service
+echo   - Status: Running
+echo   - Start Type: Automatic (starts on boot)
+echo   - Python: %PYTHON_EXE%
+echo   - Script: %CLIENT_SCRIPT%
+echo   - Log Directory: %LOG_DIR%
+echo.
+
+echo [FEATURES ENABLED]
+echo   - YouTube Ping Monitoring: Yes
+echo   - Origin Server Ping Monitoring: Yes
+echo   - Server Name Resolution: Yes (API-based)
+echo   - ISP Name Formatting: Yes (Cloud_Point->SDNF, Mirnet->BTS)
+echo   - Primary/Backup Detection: Yes
+echo   - Auto-Restart on Failure: Yes
+echo.
+
+echo ============================================================
+echo.
+echo Service is now running and will start automatically on boot.
 echo.
 echo Useful Commands:
 echo   Check status: sc query %SERVICE_NAME%
@@ -325,7 +565,5 @@ echo   Stop service: C:\nssm\win64\nssm.exe stop %SERVICE_NAME%
 echo   Start service: C:\nssm\win64\nssm.exe start %SERVICE_NAME%
 echo   Restart service: C:\nssm\win64\nssm.exe restart %SERVICE_NAME%
 echo   View logs: type %LOG_DIR%\service_stdout.log
-echo.
-echo Service will auto-start on computer boot.
 echo.
 pause

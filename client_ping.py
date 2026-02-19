@@ -121,7 +121,7 @@ server_mappings_lock = threading.Lock()  # Thread safety for accessing mappings
 API_URL = "https://om-api.udvash-unmesh.com/api/MeetingOperation/GetServerMappings"
 API_KEY = "08e56dad-ba0d-427c-ace7-4414b448f897"
 API_SECRET_KEY = "636b978e-f35b-49dd-8e05-7c020705d785"
-API_REFRESH_INTERVAL = 86400  # 24 hours in seconds
+API_REFRESH_INTERVAL = 600  # 10 minutes in seconds (refresh every 10 minutes for fresh data)
 
 # Setup logging for service mode
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
@@ -279,19 +279,18 @@ def resolve_target_to_ip(target):
             return None
 
 def server_mapping_refresh_loop():
-    """Background thread to refresh server mappings every 24 hours."""
+    """Background thread to refresh server mappings every 10 Minutes."""
     # Fetch immediately on startup
     fetch_server_mappings()
     
     while True:
         try:
-            # Wait for 24 hours
+            # Wait for 10 Minutes before refreshing again
             time.sleep(API_REFRESH_INTERVAL)
             fetch_server_mappings()
         except Exception as e:
             log_print(f"Error in server mapping refresh loop: {e}")
-            time.sleep(3600)  # Retry after 1 hour on error
-
+            time.sleep(600)  # Retry after 10 minutes on error
 # ---------------- Network Detection ----------------
 def get_local_ip():
     """Detect local IP address."""
