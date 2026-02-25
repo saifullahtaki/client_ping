@@ -1,9 +1,11 @@
 import time, requests, subprocess, os, threading, platform, socket, sys, json, shutil
+import logging
+from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1002          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1003          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 1800  # Check for updates every 30 minutes
 
 # Get absolute path of script directory
@@ -126,7 +128,33 @@ LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
 if not os.path.exists(LOG_DIR):
     os.makedirs(LOG_DIR)
 
-LOG_FILE = os.path.join(LOG_DIR, f"client_ping_{datetime.now().strftime('%Y%m%d')}.log")
+# RotatingFileHandler: max 500KB per file, keep 2 backups = 1MB total max
+LOG_FILE = os.path.join(LOG_DIR, "client_ping.log")
+_logger = logging.getLogger("client_ping")
+_logger.setLevel(logging.INFO)
+_handler = RotatingFileHandler(LOG_FILE, maxBytes=500*1024, backupCount=2, encoding="utf-8")
+_handler.setFormatter(logging.Formatter("%(message)s"))
+_logger.addHandler(_handler)
+
+def cleanup_old_logs(days=7):
+    """Delete any .log files in the logs folder older than `days` days."""
+    try:
+        cutoff = time.time() - days * 86400
+        for fname in os.listdir(LOG_DIR):
+            if not fname.endswith(".log") and not fname.endswith(".log.1") and not fname.endswith(".log.2"):
+                continue
+            fpath = os.path.join(LOG_DIR, fname)
+            if os.path.isfile(fpath) and os.path.getmtime(fpath) < cutoff:
+                os.remove(fpath)
+    except Exception:
+        pass
+
+def log_cleanup_loop():
+    """Background thread: clean up old logs once a day."""
+    cleanup_old_logs()   # run once on startup
+    while True:
+        time.sleep(86400)  # 24 hours
+        cleanup_old_logs()
 
 def log_print(message):
     """Print to both console and log file with timestamp."""
@@ -134,11 +162,7 @@ def log_print(message):
     log_msg = f"[{timestamp}] {message}"
     print(log_msg)
     sys.stdout.flush()  # Important for service mode
-    try:
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            f.write(log_msg + "\n")
-    except:
-        pass
+    _logger.info(log_msg)
 
 def format_display_name(name, name_type="target"):
     """Format display names for better readability in Grafana.
@@ -557,16 +581,7 @@ def send_ping(target, rtt, success, raw):
         "raw": raw[:2000]
     }
     try:
-        # Debug log for YouTube
-        if "youtube" in target.lower():
-            log_print(f"[DEBUG] Sending YouTube ping: target={target}, rtt={rtt}")
-        
-        response = session.post(SERVER_URL.rstrip("/") + "/push_ping", json=payload, timeout=5)
-        
-        # Debug log for YouTube response
-        if "youtube" in target.lower():
-            log_print(f"[DEBUG] YouTube ping response: status={response.status_code}")
-            
+        session.post(SERVER_URL.rstrip("/") + "/push_ping", json=payload, timeout=5)
     except Exception as e:
         log_print(f"Ping send error for {target}: {e}")
  
@@ -585,8 +600,7 @@ def check_and_apply_update():
         server_build = int(resp.json().get("build", 0))
 
         if server_build <= CLIENT_BUILD:
-            log_print(f"[AUTO-UPDATE] Up-to-date (build {CLIENT_BUILD})")
-            return
+            return  # Up-to-date, no log needed
 
         log_print(f"[AUTO-UPDATE] New version available! server={server_build}, current={CLIENT_BUILD}")
         log_print(f"[AUTO-UPDATE] Downloading...")
@@ -795,7 +809,6 @@ def ping_loop(target):
             push_client_info()  # No argument needed
             client_info_counters[target] = 0
        
-        log_print(f"{target} succ={success} rtt={rtt}")
         time.sleep(PING_INTERVAL)
  
 # ---------------- Manage Targets ----------------
@@ -913,6 +926,10 @@ if __name__=="__main__":
     log_print(f"Starting auto-update checker (current build={CLIENT_BUILD}, check interval={UPDATE_CHECK_INTERVAL}s)...")
     update_thread = threading.Thread(target=auto_update_loop, daemon=True)
     update_thread.start()
+
+    # Start log cleanup thread (deletes log files older than 7 days, runs daily)
+    cleanup_thread = threading.Thread(target=log_cleanup_loop, daemon=True)
+    cleanup_thread.start()
 
     log_print("Starting target management loop...")
     manage_targets_loop()

@@ -58,129 +58,158 @@ REM ============================================================
 set CODE_WAS_OLD=NO
 set CODE_UPDATE_METHOD=NONE
 
-echo Verifying code version...
-findstr /C:"get_server_info_from_target" "%CLIENT_SCRIPT%" >nul 2>&1
+REM ============================================================
+REM Download Latest Code from Monitor Server
+REM ============================================================
 
-if %errorLevel% EQU 0 (
-    echo [OK] Latest code detected - server mapping support found
-    echo.
-    set CODE_WAS_OLD=NO
-    goto :code_verified
-)
-
-REM OLD CODE DETECTED - Need to download latest
-set CODE_WAS_OLD=YES
-echo [WARNING] OLD CODE DETECTED!
-echo This version does not support server name resolution.
-echo.
-
-REM GitHub URL for latest code
+set MONITOR_SERVER=http://192.168.40.26:5010
 set GITHUB_URL=https://raw.githubusercontent.com/saifullahtaki/client_ping/main/client_ping.py
-
-echo Attempting to download latest code from GitHub...
-echo URL: !GITHUB_URL!
-echo.
-
-set TEMP_DOWNLOAD=!SCRIPT_DIR!\client_ping.py.download
+set TEMP_DOWNLOAD=%SCRIPT_DIR%\client_ping.py.download
 
 REM Delete any existing temp file
-if exist "!TEMP_DOWNLOAD!" del "!TEMP_DOWNLOAD!" >nul 2>&1
+if exist "%TEMP_DOWNLOAD%" del "%TEMP_DOWNLOAD%" >nul 2>&1
 
-echo Downloading to: !TEMP_DOWNLOAD!
+echo Downloading latest code from monitor server...
+echo URL: %MONITOR_SERVER%/client_script
 echo.
 
-REM Try downloading with PowerShell script
-powershell -ExecutionPolicy Bypass -File "!SCRIPT_DIR!\download_github.ps1" -Url "!GITHUB_URL!" -OutputFile "!TEMP_DOWNLOAD!"
+powershell -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri '%MONITOR_SERVER%/client_script' -OutFile '%TEMP_DOWNLOAD%' -TimeoutSec 15 -UseBasicParsing; exit 0 } catch { exit 1 }"
 
-REM Check if file was downloaded
-if exist "!TEMP_DOWNLOAD!" (
-    REM Verify downloaded file has the required function
-    findstr /C:"get_server_info_from_target" "!TEMP_DOWNLOAD!" >nul 2>&1
-    
+if exist "%TEMP_DOWNLOAD%" (
+    findstr /C:"CLIENT_BUILD" "%TEMP_DOWNLOAD%" >nul 2>&1
     if !errorLevel! EQU 0 (
-        echo [OK] Latest code downloaded successfully from GitHub!
+        echo [OK] Latest code downloaded from monitor server!
         echo.
         echo Backing up old code...
-        copy /Y "!CLIENT_SCRIPT!" "!CLIENT_SCRIPT!.old.%date:~-4%%date:~-10,2%%date:~-7,2%_%time:~0,2%%time:~3,2%%time:~6,2%.backup" >nul 2>&1
-        
-        echo Updating to latest code...
-        move /Y "!TEMP_DOWNLOAD!" "!CLIENT_SCRIPT!" >nul 2>&1
-        
+        copy /Y "%CLIENT_SCRIPT%" "%CLIENT_SCRIPT%.old.%date:~-4%%date:~-10,2%%date:~-7,2%.backup" >nul 2>&1
+        echo Applying latest code...
+        move /Y "%TEMP_DOWNLOAD%" "%CLIENT_SCRIPT%" >nul 2>&1
         if !errorLevel! EQU 0 (
-            echo [OK] Code updated successfully from GitHub!
+            echo [OK] Code updated from monitor server!
             echo.
-            set CODE_UPDATE_METHOD=GITHUB
+            set CODE_WAS_OLD=NO
+            set CODE_UPDATE_METHOD=SERVER
             goto :code_verified
         ) else (
-            echo [ERROR] Failed to replace old code!
+            echo [ERROR] Failed to replace code file!
             pause
             exit /b 1
         )
     ) else (
-        echo [ERROR] Downloaded file does not contain required features!
-        echo The file from GitHub may be outdated or incorrect.
-        del "!TEMP_DOWNLOAD!" >nul 2>&1
-        echo.
-        echo Please check GitHub URL or update manually.
-        pause
-        exit /b 1
+        echo [WARNING] Downloaded file missing CLIENT_BUILD marker, skipping...
+        del "%TEMP_DOWNLOAD%" >nul 2>&1
     )
 ) else (
-    echo [WARNING] GitHub download failed. Trying alternative methods...
+    echo [WARNING] Monitor server unreachable. Trying GitHub...
     echo.
-    
-    REM Fallback: Check USB drives for latest code
-    set LATEST_CODE_FOUND=0
-    set LATEST_CODE_PATH=
-    
-    echo Searching USB drives for latest code...
-    for %%d in (D E F G H I J K) do (
-        if exist "%%d:\client_ping.py" (
-            findstr /C:"get_server_info_from_target" "%%d:\client_ping.py" >nul 2>&1
-            if !errorLevel! EQU 0 (
-                set LATEST_CODE_FOUND=1
-                set LATEST_CODE_PATH=%%d:\client_ping.py
-                echo [FOUND] Latest code at: !LATEST_CODE_PATH!
-                goto :usb_found
-            )
-        )
-    )
-    
-    :usb_found
-    if !LATEST_CODE_FOUND! EQU 1 (
+)
+
+REM Fallback 1: GitHub
+echo Attempting to download from GitHub...
+echo URL: %GITHUB_URL%
+echo.
+
+powershell -ExecutionPolicy Bypass -Command "try { Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%TEMP_DOWNLOAD%' -TimeoutSec 30 -UseBasicParsing; exit 0 } catch { exit 1 }"
+
+if exist "%TEMP_DOWNLOAD%" (
+    findstr /C:"CLIENT_BUILD" "%TEMP_DOWNLOAD%" >nul 2>&1
+    if !errorLevel! EQU 0 (
+        echo [OK] Latest code downloaded from GitHub!
         echo.
         echo Backing up old code...
         copy /Y "%CLIENT_SCRIPT%" "%CLIENT_SCRIPT%.old.backup" >nul 2>&1
-        
-        echo Copying latest code from USB...
-        copy /Y "!LATEST_CODE_PATH!" "%CLIENT_SCRIPT%" >nul 2>&1
-        
+        echo Applying latest code...
+        move /Y "%TEMP_DOWNLOAD%" "%CLIENT_SCRIPT%" >nul 2>&1
         if !errorLevel! EQU 0 (
-            echo [OK] Code updated successfully from USB!
+            echo [OK] Code updated from GitHub!
             echo.
-            set CODE_UPDATE_METHOD=USB
+            set CODE_WAS_OLD=NO
+            set CODE_UPDATE_METHOD=GITHUB
             goto :code_verified
         ) else (
-            echo [ERROR] Failed to update code!
+            echo [ERROR] Failed to replace code file!
             pause
             exit /b 1
         )
     ) else (
+        del "%TEMP_DOWNLOAD%" >nul 2>&1
+        echo [WARNING] GitHub file missing CLIENT_BUILD, skipping...
+    )
+) else (
+    echo [WARNING] GitHub download failed. Trying USB drives...
+    echo.
+)
+
+REM Fallback 2: Check USB drives
+set LATEST_CODE_FOUND=0
+set LATEST_CODE_PATH=
+
+echo Searching USB drives for latest code...
+for %%d in (D E F G H I J K) do (
+    if exist "%%d:\client_ping.py" (
+        findstr /C:"CLIENT_BUILD" "%%d:\client_ping.py" >nul 2>&1
+        if !errorLevel! EQU 0 (
+            set LATEST_CODE_FOUND=1
+            set LATEST_CODE_PATH=%%d:\client_ping.py
+            echo [FOUND] Latest code at: !LATEST_CODE_PATH!
+            goto :usb_found
+        )
+    )
+)
+
+:usb_found
+if !LATEST_CODE_FOUND! EQU 1 (
+    echo.
+    echo Backing up old code...
+    copy /Y "%CLIENT_SCRIPT%" "%CLIENT_SCRIPT%.old.backup" >nul 2>&1
+    echo Copying latest code from USB...
+    copy /Y "!LATEST_CODE_PATH!" "%CLIENT_SCRIPT%" >nul 2>&1
+    if !errorLevel! EQU 0 (
+        echo [OK] Code updated from USB drive!
         echo.
-        echo [ERROR] Cannot download from GitHub and no USB drive found!
-        echo.
-        echo Please do one of the following:
-        echo   1. Check internet connection and GitHub URL
-        echo   2. Copy latest client_ping.py to USB drive (any drive D: to K:)
-        echo   3. Copy latest client_ping.py directly to: %CLIENT_SCRIPT%
-        echo.
-        echo Current GitHub URL: !GITHUB_URL!
-        echo (Edit this script to update the URL if needed)
-        echo.
+        set CODE_WAS_OLD=NO
+        set CODE_UPDATE_METHOD=USB
+        goto :code_verified
+    ) else (
+        echo [ERROR] Failed to copy from USB!
         pause
         exit /b 1
     )
 )
+
+REM Last resort: check if existing file is usable (has CLIENT_BUILD or old function)
+echo.
+echo [WARNING] All download sources failed. Checking existing file...
+findstr /C:"CLIENT_BUILD" "%CLIENT_SCRIPT%" >nul 2>&1
+if !errorLevel! EQU 0 (
+    echo [OK] Existing file has CLIENT_BUILD - using current version.
+    echo [INFO] Service will auto-update when monitor server is reachable.
+    echo.
+    set CODE_WAS_OLD=NO
+    set CODE_UPDATE_METHOD=EXISTING
+    goto :code_verified
+)
+
+findstr /C:"get_server_info_from_target" "%CLIENT_SCRIPT%" >nul 2>&1
+if !errorLevel! EQU 0 (
+    echo [WARNING] Using existing older code (no CLIENT_BUILD).
+    echo [INFO] Manual update recommended.
+    echo.
+    set CODE_WAS_OLD=NO
+    set CODE_UPDATE_METHOD=EXISTING_OLD
+    goto :code_verified
+)
+
+echo.
+echo [ERROR] Cannot obtain valid code from any source!
+echo.
+echo Please do one of the following:
+echo   1. Connect to the LAN (server: 192.168.40.26)
+echo   2. Connect to internet (GitHub download)
+echo   3. Copy latest client_ping.py to USB drive (any drive D: to K:)
+echo.
+pause
+exit /b 1
 
 :code_verified
 REM Code is now verified - continue with service installation
@@ -596,26 +625,29 @@ echo    INSTALLATION SUMMARY
 echo ============================================================
 echo.
 
-if "!CODE_WAS_OLD!"=="YES" (
-    echo [CODE STATUS]
-    echo   - Initial Status: OLD CODE (no server name support)
-    if "!CODE_UPDATE_METHOD!"=="GITHUB" (
-        echo   - Update Method: Downloaded from GitHub
-        echo   - GitHub URL: https://raw.githubusercontent.com/saifullahtaki/client_ping/main/client_ping.py
-    ) else if "!CODE_UPDATE_METHOD!"=="USB" (
-        echo   - Update Method: Copied from USB drive
-    ) else (
-        echo   - Update Method: Manual update required
-    )
-    echo   - Final Status: NEW CODE (with server name support)
+echo [CODE STATUS]
+if "!CODE_UPDATE_METHOD!"=="SERVER" (
+    echo   - Source: Monitor Server (192.168.40.26)
+    echo   - Action: Updated to latest build from server
     echo   - Backup Created: Yes
-    echo.
+) else if "!CODE_UPDATE_METHOD!"=="GITHUB" (
+    echo   - Source: GitHub (server unreachable)
+    echo   - Action: Updated from GitHub
+    echo   - Backup Created: Yes
+) else if "!CODE_UPDATE_METHOD!"=="USB" (
+    echo   - Source: USB Drive (server + GitHub unreachable)
+    echo   - Action: Updated from USB
+    echo   - Backup Created: Yes
+) else if "!CODE_UPDATE_METHOD!"=="EXISTING" (
+    echo   - Source: Existing file (all downloads failed)
+    echo   - Action: Used current version - will auto-update via service
+) else if "!CODE_UPDATE_METHOD!"=="EXISTING_OLD" (
+    echo   - Source: Existing older file
+    echo   - Action: Manual update recommended
 ) else (
-    echo [CODE STATUS]
-    echo   - Initial Status: NEW CODE (already up-to-date)
-    echo   - Update Required: No
-    echo.
+    echo   - Source: Unknown
 )
+echo.
 
 echo [PYTHON ENVIRONMENT]
 echo   - Python Executable: %PYTHON_EXE%
