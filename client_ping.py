@@ -3,7 +3,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1001          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1002          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 1800  # Check for updates every 30 minutes
 
 # Get absolute path of script directory
@@ -163,8 +163,8 @@ def format_display_name(name, name_type="target"):
             "Link3 Technologies Limited": "Link3",
             "Bangladesh_Online_Ltd": "BOL",
             "Bangladesh Online Ltd": "BOL",
-            "Cloud_point": "SDNF",
-            "Cloud point": "SDNF",
+            "Cloud_Point": "SDNF",
+            "Cloud Point": "SDNF",
             "Amber_IT_Limited": "AmberIT",
             "Amber IT Limited": "AmberIT",
             "Mirnet": "BTS",
