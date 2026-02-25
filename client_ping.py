@@ -1,5 +1,10 @@
-import time, requests, subprocess, os, threading, platform, socket, sys, json
+import time, requests, subprocess, os, threading, platform, socket, sys, json, shutil
 from datetime import datetime
+import psutil
+
+# --------------- Version (Auto-Update) ---------------
+CLIENT_BUILD = 1001          # Increment this each time you deploy a new version
+UPDATE_CHECK_INTERVAL = 1800  # Check for updates every 30 minutes
 
 # Get absolute path of script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -106,22 +111,15 @@ client_local_ip = "unknown"
 client_public_ip = "unknown"
 client_isp_name = "unknown"
 
+# Global variables for real-time network speed (updated every second)
+network_download_mbps = 0.0
+network_upload_mbps = 0.0
+
 # Global variables to store OBS streaming data
 obs_icr_code = "unknown"
 obs_stream_title = "unknown"
 obs_stream_preview_ostream = "unknown"
 obs_stream_preview_youtube = "unknown"
-
-# Global variables to store server mappings from API
-server_mappings = []  # List of server mapping objects
-server_mappings_last_updated = 0  # Timestamp of last API fetch
-server_mappings_lock = threading.Lock()  # Thread safety for accessing mappings
-
-# API Configuration for Server Mappings
-API_URL = "https://om-api.udvash-unmesh.com/api/MeetingOperation/GetServerMappings"
-API_KEY = "08e56dad-ba0d-427c-ace7-4414b448f897"
-API_SECRET_KEY = "636b978e-f35b-49dd-8e05-7c020705d785"
-API_REFRESH_INTERVAL = 600  # 10 minutes in seconds (refresh every 10 minutes for fresh data)
 
 # Setup logging for service mode
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
@@ -181,89 +179,6 @@ def format_display_name(name, name_type="target"):
     
     return name
 
-# ---------------- Server Mapping API Functions ----------------
-def fetch_server_mappings():
-    """Fetch server mappings from API and update global cache."""
-    global server_mappings, server_mappings_last_updated
-    
-    try:
-        log_print("Fetching server mappings from API...")
-        headers = {
-            "ApiKey": API_KEY,
-            "ApiSecretKey": API_SECRET_KEY,
-            "Content-Type": "application/json"
-        }
-        
-        response = requests.get(API_URL, headers=headers, timeout=30)
-        
-        if response.status_code == 200:
-            response_data = response.json()
-            
-            # API returns wrapper object with 'data' field containing the array
-            if isinstance(response_data, dict) and 'data' in response_data:
-                data = response_data['data']
-                with server_mappings_lock:
-                    server_mappings = data if isinstance(data, list) else []
-                    server_mappings_last_updated = time.time()
-                
-                log_print(f"Successfully fetched {len(server_mappings)} server mappings")
-                
-                # Log sample mappings for debugging
-                for mapping in server_mappings[:3]:  # Show first 3
-                    log_print(f"  Mapping: {mapping.get('lburl')} -> Primary: {mapping.get('primaryServer')} ({mapping.get('primaryServerIp')})")
-                
-                return True
-            else:
-                log_print(f"Unexpected API response format: {response_data}")
-                return False
-        else:
-            log_print(f"Failed to fetch server mappings: HTTP {response.status_code}")
-            return False
-            
-    except Exception as e:
-        log_print(f"Error fetching server mappings: {e}")
-        return False
-
-def get_server_info_from_target(target, resolved_ip):
-    """Get server name and type by matching target hostname with lburl in API mapping.
-    Then check if resolved IP is primary or backup for that lburl.
-    
-    Returns: (server_name, server_type) tuple
-    - server_type: "P" for primary, "B" for backup, "" for unknown
-    """
-    if not target or not resolved_ip:
-        return "", ""
-    
-    with server_mappings_lock:
-        # Find the mapping that matches this target's lburl
-        for mapping in server_mappings:
-            lburl = mapping.get("lburl", "")
-            
-            # Check if target matches this lburl (case-insensitive)
-            if lburl and lburl.lower() in target.lower():
-                # Found the correct lburl mapping, now check if resolved IP is primary or backup
-                primary_ip = mapping.get("primaryServerIp", "")
-                backup_ip = mapping.get("backupServerIp", "")
-                
-                if resolved_ip == primary_ip:
-                    # This IP is the primary server for this lburl
-                    return mapping.get("primaryServer", ""), "P"
-                elif resolved_ip == backup_ip:
-                    # This IP is the backup server for this lburl
-                    return mapping.get("backupServer", ""), "B"
-                else:
-                    # IP doesn't match primary or backup (shouldn't happen)
-                    return "", ""
-        
-        # If no lburl match found, try fallback: direct IP match (for backward compatibility)
-        for mapping in server_mappings:
-            if mapping.get("primaryServerIp") == resolved_ip:
-                return mapping.get("primaryServer", ""), "P"
-            if mapping.get("backupServerIp") == resolved_ip:
-                return mapping.get("backupServer", ""), "B"
-    
-    return "", ""
-
 def resolve_target_to_ip(target):
     """Resolve hostname/target to IP address."""
     try:
@@ -278,19 +193,6 @@ def resolve_target_to_ip(target):
         except:
             return None
 
-def server_mapping_refresh_loop():
-    """Background thread to refresh server mappings every 10 Minutes."""
-    # Fetch immediately on startup
-    fetch_server_mappings()
-    
-    while True:
-        try:
-            # Wait for 10 Minutes before refreshing again
-            time.sleep(API_REFRESH_INTERVAL)
-            fetch_server_mappings()
-        except Exception as e:
-            log_print(f"Error in server mapping refresh loop: {e}")
-            time.sleep(600)  # Retry after 10 minutes on error
 # ---------------- Network Detection ----------------
 def get_local_ip():
     """Detect local IP address."""
@@ -609,18 +511,12 @@ def do_ping_once(target):
  
 # ---------------- Send ping ----------------
 def send_ping(target, rtt, success, raw):
-    # Resolve target to IP and get server name
+    # Resolve target to IP (server will do the mapping)
     target_ip = resolve_target_to_ip(target)
-    server_name = ""  # Default to empty string
-    server_type = ""  # P or B (Primary/Backup)
     stream_id = ""  # Stream ID for preview URL
     
-    # Only resolve server name for udvashunmesh.com targets
+    # Extract stream ID from preview URL for udvashunmesh.com targets
     if target_ip and ".udvashunmesh.com" in target.lower():
-        # Use new function that checks target hostname against lburl
-        server_name, server_type = get_server_info_from_target(target, target_ip)
-        
-        # Extract stream ID from preview URL
         if obs_stream_preview_ostream and obs_stream_preview_ostream != "unknown":
             try:
                 if "streamName=" in obs_stream_preview_ostream:
@@ -629,8 +525,7 @@ def send_ping(target, rtt, success, raw):
                 pass
         
         # If no stream_id from preview, create a fallback using target name
-        if not stream_id and server_name:
-            # Use target as fallback stream identifier
+        if not stream_id:
             stream_id = target.replace(".udvashunmesh.com", "").replace("os-origin-server-", "")
     
     # For YouTube, extract video ID
@@ -650,9 +545,7 @@ def send_ping(target, rtt, success, raw):
         "computer_name": AGENT_NAME,  # Add computer name
         "target": target,
         "target_display": target_display,  # Shortened display name
-        "target_ip": target_ip if target_ip else "",  # Include resolved IP
-        "server_name": server_name,  # Include resolved server name (empty for non-udvashunmesh targets)
-        "server_type": server_type,  # P or B (Primary/Backup)
+        "target_ip": target_ip if target_ip else "",  # Server will map this IP to server_name/type
         "stream_id": stream_id,  # Stream ID for URL generation
         "isp": client_isp_name,  # Include ISP name
         "isp_display": isp_display,  # Shortened ISP display name
@@ -666,7 +559,7 @@ def send_ping(target, rtt, success, raw):
     try:
         # Debug log for YouTube
         if "youtube" in target.lower():
-            log_print(f"[DEBUG] Sending YouTube ping: target={target}, rtt={rtt}, server_name={server_name}")
+            log_print(f"[DEBUG] Sending YouTube ping: target={target}, rtt={rtt}")
         
         response = session.post(SERVER_URL.rstrip("/") + "/push_ping", json=payload, timeout=5)
         
@@ -677,6 +570,147 @@ def send_ping(target, rtt, success, raw):
     except Exception as e:
         log_print(f"Ping send error for {target}: {e}")
  
+# ---------------- Network Speed Monitoring ----------------
+def check_and_apply_update():
+    """
+    Check server for a newer build of client_ping.py.
+    If found: download → verify → replace current script → exit.
+    NSSM auto-restarts the service, loading the new code.
+    """
+    try:
+        resp = session.get(SERVER_URL.rstrip("/") + "/client_version", timeout=10)
+        if resp.status_code != 200:
+            return
+
+        server_build = int(resp.json().get("build", 0))
+
+        if server_build <= CLIENT_BUILD:
+            log_print(f"[AUTO-UPDATE] Up-to-date (build {CLIENT_BUILD})")
+            return
+
+        log_print(f"[AUTO-UPDATE] New version available! server={server_build}, current={CLIENT_BUILD}")
+        log_print(f"[AUTO-UPDATE] Downloading...")
+
+        dl = session.get(SERVER_URL.rstrip("/") + "/client_script", timeout=30)
+        if dl.status_code != 200:
+            log_print(f"[AUTO-UPDATE] Download failed: HTTP {dl.status_code}")
+            return
+
+        new_code = dl.text
+
+        # Verify the downloaded file actually has the expected build number
+        if f"CLIENT_BUILD = {server_build}" not in new_code:
+            log_print(f"[AUTO-UPDATE] Verification failed - BUILD number mismatch in downloaded file")
+            return
+
+        current_script = os.path.abspath(__file__)
+        temp_file  = current_script + ".update"
+        backup_file = current_script + ".backup"
+
+        # Write to temp file
+        with open(temp_file, "w", encoding="utf-8") as f:
+            f.write(new_code)
+
+        log_print(f"[AUTO-UPDATE] Downloaded {len(new_code)} bytes OK")
+
+        # Backup current version
+        if os.path.exists(backup_file):
+            os.remove(backup_file)
+        shutil.copy2(current_script, backup_file)
+
+        # Replace with new version (Python already loaded itself into memory - safe to overwrite)
+        shutil.move(temp_file, current_script)
+
+        log_print(f"[AUTO-UPDATE] Applied build {server_build}. Restarting service...")
+        sys.exit(0)   # NSSM will restart automatically with new code
+
+    except Exception as e:
+        log_print(f"[AUTO-UPDATE] Error: {e}")
+
+
+def auto_update_loop():
+    """Background thread: wait 2 min on startup, then check every 30 min."""
+    time.sleep(120)   # Let service stabilize before first check
+    while True:
+        check_and_apply_update()
+        time.sleep(UPDATE_CHECK_INTERVAL)
+
+
+# ---------------- Network Speed Monitoring ----------------
+def push_network_speed(download_mbps, upload_mbps):
+    """Send real-time network speed to server for InfluxDB storage."""
+    try:
+        isp_display = format_display_name(client_isp_name, "isp")
+        payload = {
+            "client_id": client_local_ip,
+            "computer_name": AGENT_NAME,
+            "isp": client_isp_name,
+            "isp_display": isp_display,
+            "download_mbps": round(download_mbps, 4),
+            "upload_mbps": round(upload_mbps, 4),
+            "timestamp": int(time.time())
+        }
+        session.post(SERVER_URL.rstrip("/") + "/push_network_speed", json=payload, timeout=5)
+    except Exception:
+        pass  # Silent - not critical
+
+def network_speed_loop():
+    """
+    Background thread: measures real-time network speed every 1 second.
+    Uses psutil - same method as Windows Task Manager (delta of OS network counters).
+    Sends download + upload in Mbps to InfluxDB via server.
+    """
+    global network_download_mbps, network_upload_mbps
+
+    # Initial sample
+    prev_io = psutil.net_io_counters(pernic=True)
+    prev_time = time.perf_counter()
+
+    while True:
+        try:
+            time.sleep(1)
+            curr_io = psutil.net_io_counters(pernic=True)
+            curr_time = time.perf_counter()
+            elapsed = curr_time - prev_time
+
+            total_sent = 0
+            total_recv = 0
+
+            for nic, curr in curr_io.items():
+                # Skip loopback interfaces (same as Task Manager)
+                if nic.lower() == 'lo' or 'loopback' in nic.lower():
+                    continue
+                prev = prev_io.get(nic)
+                if prev:
+                    sent_delta = curr.bytes_sent - prev.bytes_sent
+                    recv_delta = curr.bytes_recv - prev.bytes_recv
+                    # Guard against counter resets (negative delta)
+                    if sent_delta >= 0:
+                        total_sent += sent_delta
+                    if recv_delta >= 0:
+                        total_recv += recv_delta
+
+            # bytes/s → Mbps  (bits per second / 1,000,000)
+            download_mbps = (total_recv * 8) / (1_000_000 * elapsed)
+            upload_mbps = (total_sent * 8) / (1_000_000 * elapsed)
+
+            # Clamp to 0 (no negatives)
+            download_mbps = max(0.0, round(download_mbps, 4))
+            upload_mbps   = max(0.0, round(upload_mbps, 4))
+
+            network_download_mbps = download_mbps
+            network_upload_mbps   = upload_mbps
+
+            prev_io   = curr_io
+            prev_time = curr_time
+
+            # Push to server every second
+            push_network_speed(download_mbps, upload_mbps)
+
+        except Exception as e:
+            log_print(f"Network speed error: {e}")
+            time.sleep(5)
+
 # ---------------- Push ISP info ----------------
 def push_client_info():
     """Push client info to server using detected values."""
@@ -846,13 +880,7 @@ if __name__=="__main__":
     log_print(f"  POLL_INTERVAL: {POLL_INTERVAL} seconds")
     log_print(f"  Auto-detect mode: OBS process and environment will be checked every {POLL_INTERVAL} seconds")
     log_print(f"  Smart monitoring: Only monitors when OBS is running")
-    log_print(f"  API Mapping: Server mappings will be fetched every 24 hours from API")
     log_print("="*60)
-    
-    # Start server mapping refresh thread
-    log_print("Starting server mapping refresh thread...")
-    mapping_thread = threading.Thread(target=server_mapping_refresh_loop, daemon=True)
-    mapping_thread.start()
     
     # Detect client info at startup
     log_print("Detecting network information...")
@@ -875,6 +903,16 @@ if __name__=="__main__":
     
     refresh_thread = threading.Thread(target=refresh_client_info, daemon=True)
     refresh_thread.start()
-    
+
+    # Start network speed monitoring thread (Task Manager-style: 1 second interval)
+    log_print("Starting real-time network speed monitoring...")
+    speed_thread = threading.Thread(target=network_speed_loop, daemon=True)
+    speed_thread.start()
+
+    # Start auto-update thread (checks server for new version every 30 minutes)
+    log_print(f"Starting auto-update checker (current build={CLIENT_BUILD}, check interval={UPDATE_CHECK_INTERVAL}s)...")
+    update_thread = threading.Thread(target=auto_update_loop, daemon=True)
+    update_thread.start()
+
     log_print("Starting target management loop...")
     manage_targets_loop()

@@ -215,13 +215,38 @@ echo Checking Python installation...
 set PYTHON_EXE=
 set PYTHON_FOUND=0
 
-REM Try to find Python
-where python >nul 2>&1
-if %errorLevel% EQU 0 (
-    for /f "delims=" %%i in ('where python 2^>nul') do (
-        set PYTHON_EXE=%%i
-        set PYTHON_FOUND=1
-        goto :python_found
+REM Try to find real Python (skip Windows Store aliases)
+for /f "delims=" %%i in ('where python 2^>nul') do (
+    set "TEST_PYTHON=%%i"
+    REM Skip Windows Store alias path
+    echo !TEST_PYTHON! | findstr /I /C:"WindowsApps" >nul
+    if errorlevel 1 (
+        REM This is a real Python, test if it works
+        "!TEST_PYTHON!" --version >nul 2>&1
+        if !errorLevel! EQU 0 (
+            set "PYTHON_EXE=!TEST_PYTHON!"
+            set PYTHON_FOUND=1
+            goto :python_found
+        )
+    )
+)
+
+REM If no real Python found, try common installation paths
+if %PYTHON_FOUND% EQU 0 (
+    for %%p in (
+        "C:\Python312\python.exe"
+        "C:\Python311\python.exe"
+        "C:\Python310\python.exe"
+        "C:\Program Files\Python312\python.exe"
+        "C:\Program Files\Python311\python.exe"
+        "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+        "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+    ) do (
+        if exist %%p (
+            set "PYTHON_EXE=%%~p"
+            set PYTHON_FOUND=1
+            goto :python_found
+        )
     )
 )
 
@@ -252,20 +277,59 @@ if %PYTHON_FOUND% EQU 1 (
     
     echo [OK] Python installed successfully
     echo Refreshing PATH...
+    echo.
     
     REM Refresh environment variables
     for /f "tokens=2*" %%a in ('reg query "HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\Environment" /v Path 2^>nul') do set "SYS_PATH=%%b"
     for /f "tokens=2*" %%a in ('reg query "HKCU\Environment" /v Path 2^>nul') do set "USR_PATH=%%b"
     set "PATH=%SYS_PATH%;%USR_PATH%"
     
-    REM Try finding Python again
-    where python >nul 2>&1
-    if %errorLevel% EQU 0 (
-        for /f "delims=" %%i in ('where python 2^>nul') do set PYTHON_EXE=%%i
-        echo [OK] Python found after installation: !PYTHON_EXE!
-    ) else (
+    REM Wait a moment for installation to complete
+    timeout /t 3 /nobreak >nul
+    
+    REM Try finding Python in common locations after winget install
+    set PYTHON_FOUND=0
+    for %%p in (
+        "%LOCALAPPDATA%\Programs\Python\Python312\python.exe"
+        "%LOCALAPPDATA%\Programs\Python\Python311\python.exe"
+        "C:\Program Files\Python312\python.exe"
+        "C:\Program Files\Python311\python.exe"
+        "C:\Python312\python.exe"
+        "C:\Python311\python.exe"
+    ) do (
+        if exist %%p (
+            set "PYTHON_EXE=%%~p"
+            set PYTHON_FOUND=1
+            echo [OK] Python found: !PYTHON_EXE!
+            goto :after_python_install
+        )
+    )
+    
+    REM Last resort: try where command again (skip Windows Store)
+    for /f "delims=" %%i in ('where python 2^>nul') do (
+        set "TEST_PYTHON=%%i"
+        echo !TEST_PYTHON! | findstr /I /C:"WindowsApps" >nul
+        if errorlevel 1 (
+            "!TEST_PYTHON!" --version >nul 2>&1
+            if !errorLevel! EQU 0 (
+                set "PYTHON_EXE=!TEST_PYTHON!"
+                set PYTHON_FOUND=1
+                echo [OK] Python found: !PYTHON_EXE!
+                goto :after_python_install
+            )
+        )
+    )
+    
+    :after_python_install
+    if %PYTHON_FOUND% EQU 0 (
         echo [ERROR] Python installed but not found in PATH
-        echo Please restart this script or reboot your computer
+        echo.
+        echo Please try one of these solutions:
+        echo 1. Close this window and run the script again
+        echo 2. Reboot your computer
+        echo 3. Manually install Python from https://www.python.org/downloads/
+        echo    (Make sure to check "Add Python to PATH" during installation)
+        echo.
         pause
         exit /b 1
     )
@@ -281,7 +345,7 @@ echo Installing Python dependencies...
 echo.
 
 REM Upgrade pip first
-echo [1/2] Upgrading pip...
+echo [1/3] Upgrading pip...
 "%PYTHON_EXE%" -m pip install --upgrade pip --quiet
 
 if %errorLevel% NEQ 0 (
@@ -289,7 +353,7 @@ if %errorLevel% NEQ 0 (
 )
 
 REM Install requests package
-echo [2/2] Installing requests package...
+echo [2/3] Installing requests package...
 "%PYTHON_EXE%" -m pip install requests --quiet
 
 if %errorLevel% NEQ 0 (
@@ -309,21 +373,44 @@ if %errorLevel% NEQ 0 (
     )
 )
 
-REM Verify installation by testing import
+REM Install psutil package (for real-time network speed monitoring)
+echo [3/3] Installing psutil package (network speed monitoring)...
+"%PYTHON_EXE%" -m pip install psutil --quiet
+
+if %errorLevel% NEQ 0 (
+    echo [WARNING] Failed to install psutil silently, trying verbose mode...
+    "%PYTHON_EXE%" -m pip install psutil
+    
+    if %errorLevel% NEQ 0 (
+        echo [ERROR] Failed to install psutil package!
+        echo.
+        echo This package is required for network speed monitoring.
+        echo Please check your internet connection and try again.
+        echo.
+        echo Manual installation: %PYTHON_EXE% -m pip install psutil
+        echo.
+        pause
+        exit /b 1
+    )
+)
+
+REM Verify installation by testing imports
 echo Verifying installation...
-"%PYTHON_EXE%" -c "import requests; print('requests version:', requests.__version__)" >nul 2>&1
+"%PYTHON_EXE%" -c "import requests; import psutil; print('OK')" >nul 2>&1
 
 if %errorLevel% EQU 0 (
     echo.
     echo [OK] All Python dependencies installed and verified
     echo     - pip (latest)
     echo     - requests (for HTTP API calls)
+    echo     - psutil (for real-time network speed monitoring)
 ) else (
     echo.
     echo [WARNING] Package verification failed, but this is often a cache issue.
     echo The service will attempt to use the packages anyway.
     echo.
-    echo If service fails to start, manually run: %PYTHON_EXE% -m pip install requests
+    echo If service fails to start, manually run:
+    echo   %PYTHON_EXE% -m pip install requests psutil
     echo.
 )
 echo.
@@ -533,7 +620,7 @@ if "!CODE_WAS_OLD!"=="YES" (
 echo [PYTHON ENVIRONMENT]
 echo   - Python Executable: %PYTHON_EXE%
 for /f "delims=" %%v in ('"%PYTHON_EXE%" --version 2^>^&1') do echo   - Version: %%v
-echo   - Required Packages: requests
+echo   - Required Packages: requests, psutil
 echo   - Installation Status: Verified
 echo.
 echo [SERVICE STATUS]
@@ -552,6 +639,7 @@ echo   - Origin Server Ping Monitoring: Yes
 echo   - Server Name Resolution: Yes (API-based)
 echo   - ISP Name Formatting: Yes (Cloud_Point->SDNF, Mirnet->BTS)
 echo   - Primary/Backup Detection: Yes
+echo   - Network Speed Monitoring: Yes (Download + Upload Mbps, 1s interval)
 echo   - Auto-Restart on Failure: Yes
 echo.
 
