@@ -6,7 +6,7 @@ import psutil
 
 # --------------- Version (Auto-Update) ---------------
 CLIENT_BUILD = 1003          # Increment this each time you deploy a new version
-UPDATE_CHECK_INTERVAL = 1800  # Check for updates every 30 minutes
+UPDATE_CHECK_INTERVAL = 3600  # Check for updates every 30 minutes
 
 # Get absolute path of script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
