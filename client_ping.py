@@ -5,8 +5,8 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1003          # Increment this each time you deploy a new version
-UPDATE_CHECK_INTERVAL = 3600  # Check for updates every 30 minutes
+CLIENT_BUILD = 1018          # Increment this each time you deploy a new version
+UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -84,6 +84,8 @@ def get_env_from_registry(name, default=""):
     return os.environ.get(name, default)
  
 SERVER_URL = get_env_from_registry("SERVER_URL", "http://ostreamping.ums.team:5010")
+#SERVER_URL = get_env_from_registry("SERVER_URL", "http://182.163.115.242:50100")
+
  
  
 # Auto-detect AGENT_NAME from hostname/computer name
@@ -116,6 +118,10 @@ client_isp_name = "unknown"
 # Global variables for real-time network speed (updated every second)
 network_download_mbps = 0.0
 network_upload_mbps = 0.0
+
+# Global GPU cache (updated every 3 seconds by background thread)
+_gpu_usage = 0.0
+_gpu_name = "unknown"
 
 # Global variables to store OBS streaming data
 obs_icr_code = "unknown"
@@ -310,12 +316,12 @@ def is_obs_running():
     """Check if OBS process is running."""
     try:
         if platform.system().lower() == 'windows':
+            _flags = subprocess.CREATE_NO_WINDOW
             # Check for common OBS process names
             result = subprocess.run(
                 ['tasklist', '/FI', 'IMAGENAME eq obs64.exe', '/NH'],
-                capture_output=True,
-                text=True,
-                timeout=2
+                capture_output=True, text=True, timeout=2,
+                creationflags=_flags
             )
             if 'obs64.exe' in result.stdout.lower():
                 return True
@@ -323,9 +329,8 @@ def is_obs_running():
             # Also check for 32-bit OBS
             result = subprocess.run(
                 ['tasklist', '/FI', 'IMAGENAME eq obs32.exe', '/NH'],
-                capture_output=True,
-                text=True,
-                timeout=2
+                capture_output=True, text=True, timeout=2,
+                creationflags=_flags
             )
             if 'obs32.exe' in result.stdout.lower():
                 return True
@@ -333,9 +338,8 @@ def is_obs_running():
             # Check for generic obs.exe
             result = subprocess.run(
                 ['tasklist', '/FI', 'IMAGENAME eq obs.exe', '/NH'],
-                capture_output=True,
-                text=True,
-                timeout=2
+                capture_output=True, text=True, timeout=2,
+                creationflags=_flags
             )
             if 'obs.exe' in result.stdout.lower():
                 return True
@@ -347,7 +351,7 @@ def is_obs_running():
                 timeout=2
             )
             return result.returncode == 0
-    except Exception:
+    except BaseException:
         pass
     
     return False
@@ -586,6 +590,22 @@ def send_ping(target, rtt, success, raw):
         log_print(f"Ping send error for {target}: {e}")
  
 # ---------------- Network Speed Monitoring ----------------
+def push_agent_version():
+    """Report this PC's current build + identity to server for /pc_versions dashboard."""
+    try:
+        payload = {
+            "computer_name": AGENT_NAME,
+            "build":         CLIENT_BUILD,
+            "local_ip":      client_local_ip,
+            "public_ip":     client_public_ip,
+            "isp":           client_isp_name,
+            "gpu_name":      _gpu_name,
+        }
+        session.post(SERVER_URL.rstrip("/") + "/push_agent_version", json=payload, timeout=5)
+    except Exception:
+        pass
+
+
 def check_and_apply_update():
     """
     Check server for a newer build of client_ping.py.
@@ -636,17 +656,18 @@ def check_and_apply_update():
         shutil.move(temp_file, current_script)
 
         log_print(f"[AUTO-UPDATE] Applied build {server_build}. Restarting service...")
-        sys.exit(0)   # NSSM will restart automatically with new code
+        os._exit(0)   # Force-kill entire process (sys.exit only kills the thread)
 
     except Exception as e:
         log_print(f"[AUTO-UPDATE] Error: {e}")
 
 
 def auto_update_loop():
-    """Background thread: wait 2 min on startup, then check every 30 min."""
-    time.sleep(120)   # Let service stabilize before first check
+    """Background thread: wait 5s on startup, then check every UPDATE_CHECK_INTERVAL seconds."""
+    time.sleep(5)   # Let service stabilize before first check
     while True:
         check_and_apply_update()
+        push_agent_version()   # Report current build to /pc_versions dashboard
         time.sleep(UPDATE_CHECK_INTERVAL)
 
 
@@ -725,6 +746,138 @@ def network_speed_loop():
             log_print(f"Network speed error: {e}")
             time.sleep(5)
 
+# ---------------- System Stats (CPU + Memory + GPU) ----------------
+def _try_install_gputil():
+    """Silently install GPUtil if not present (NVIDIA GPU fast path)."""
+    try:
+        import GPUtil
+        return True
+    except ImportError:
+        pass
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pip", "install", "gputil", "--quiet"],
+            timeout=60, capture_output=True
+        )
+        import GPUtil  # noqa: F401
+        log_print("[GPU] GPUtil installed successfully (NVIDIA fast path enabled)")
+        return True
+    except Exception:
+        return False
+
+def _detect_gpu_name():
+    """One-time GPU name detection at startup. Returns name string."""
+    # Method 1: GPUtil (NVIDIA)
+    try:
+        import GPUtil
+        gpus = GPUtil.getGPUs()
+        if gpus:
+            return "+".join(g.name.strip() for g in gpus)
+    except Exception:
+        pass
+    # Method 2: WMI via PowerShell (AMD/Intel/all)
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command",
+             "Get-WmiObject Win32_VideoController | Select-Object -ExpandProperty Name"],
+            capture_output=True, text=True, timeout=10,
+            creationflags=subprocess.CREATE_NO_WINDOW
+        )
+        names = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
+        if names:
+            return "+".join(names)
+    except Exception:
+        pass
+    return "unknown"
+
+def _gpu_monitor_loop():
+    """
+    Background thread: detects GPU name once, then polls GPU usage every 3 seconds.
+    Uses Windows GPU Engine performance counters (all engine types) for accurate
+    GPU usage across NVIDIA/AMD/Intel — including NVENC, VideoDecode, 3D, Compute.
+    GPUtil is kept only for name detection; NOT used for usage (it misses NVENC).
+    Runs separately so slow GPU queries never block the 1-second stats loop.
+    """
+    global _gpu_usage, _gpu_name
+    _try_install_gputil()   # auto-install GPUtil (used only for GPU name detection)
+    _gpu_name = _detect_gpu_name()
+    log_print(f"[GPU] Detected: {_gpu_name}")
+
+    # PowerShell command explanation:
+    # - Queries ALL GPU engine types: 3D, VideoEncode, VideoDecode, Compute, etc.
+    # - Groups counters by GPU index, sums each GPU's total engine usage
+    # - Returns the maximum across all GPUs (handles multi-GPU systems correctly)
+    # - Caps at 100.0 per GPU before reporting
+    _PS_GPU_CMD = (
+        "$samples=(Get-Counter '\\GPU Engine(*)\\Utilization Percentage'"
+        " -ErrorAction SilentlyContinue).CounterSamples;"
+        "$byGpu=$samples|Group-Object{[regex]::Match($_.InstanceName,'luid.*?_phys_(\\d+)').Value};"
+        "$maxVal=($byGpu|ForEach-Object{"
+        "  [Math]::Min(100,($_.Group|Measure-Object CookedValue -Sum).Sum)"
+        "}|Measure-Object -Maximum).Maximum;"
+        "if([double]::IsNaN($maxVal) -or $maxVal -eq $null){0}else{[Math]::Round($maxVal,1)}"
+    )
+
+    while True:
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", _PS_GPU_CMD],
+                capture_output=True, text=True, timeout=10,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            val = result.stdout.strip()
+            if val:
+                _gpu_usage = min(100.0, round(float(val), 1))
+        except Exception:
+            pass
+        time.sleep(3)
+
+def push_system_stats(cpu_percent, mem_total_mb, mem_available_mb, mem_used_mb, mem_percent):
+    """Send CPU and memory stats to server for InfluxDB storage."""
+    try:
+        isp_display = format_display_name(client_isp_name, "isp")
+        payload = {
+            "client_id": client_local_ip,
+            "computer_name": AGENT_NAME,
+            "isp": client_isp_name,
+            "isp_display": isp_display,
+            "cpu_percent": cpu_percent,
+            "mem_total_mb": mem_total_mb,
+            "mem_available_mb": mem_available_mb,
+            "mem_used_mb": mem_used_mb,
+            "mem_percent": mem_percent,
+            "gpu_usage_percent": _gpu_usage,
+            "gpu_name": _gpu_name,
+            "timestamp": int(time.time())
+        }
+        session.post(SERVER_URL.rstrip("/") + "/push_system_stats", json=payload, timeout=5)
+    except Exception:
+        pass  # Silent - not critical
+
+def system_stats_loop():
+    """
+    Background thread: measures CPU and memory every 1 second.
+    Uses psutil - same method as Windows Task Manager.
+    CPU: percentage over last 1 second interval.
+    Memory: total, available, used (MB) and percent.
+    """
+    # First call initializes the CPU counter (returns 0.0, discard)
+    psutil.cpu_percent(interval=None)
+
+    while True:
+        try:
+            time.sleep(1)
+            cpu = psutil.cpu_percent(interval=None)   # non-blocking, delta since last call
+            mem = psutil.virtual_memory()
+            mem_total_mb     = round(mem.total     / (1024 * 1024), 1)
+            mem_available_mb = round(mem.available / (1024 * 1024), 1)
+            mem_used_mb      = round(mem.used      / (1024 * 1024), 1)
+            mem_percent      = round(mem.percent, 1)
+            push_system_stats(cpu, mem_total_mb, mem_available_mb, mem_used_mb, mem_percent)
+        except Exception as e:
+            log_print(f"System stats error: {e}")
+            time.sleep(5)
+
 # ---------------- Push ISP info ----------------
 def push_client_info():
     """Push client info to server using detected values."""
@@ -767,6 +920,7 @@ def push_client_info():
         payload = {
             "client_id": client_local_ip,
             "computer_name": AGENT_NAME,
+            "build": CLIENT_BUILD,
             "local_ip": client_local_ip,
             "public_ip": client_public_ip,
             "isp": client_isp_name,
@@ -821,7 +975,10 @@ def manage_targets_loop():
         try:
             # Check if OBS is running
             obs_running = is_obs_running()
-            
+        except KeyboardInterrupt:
+            log_print("[SHUTDOWN] KeyboardInterrupt received — service stopping.")
+            os._exit(0)
+        try:
             # Log OBS status change
             if obs_running != last_obs_status:
                 if obs_running:
@@ -879,9 +1036,16 @@ def manage_targets_loop():
                 log_print(f"Stopped monitoring target: {t}")
            
             known_targets = new_targets
+        except KeyboardInterrupt:
+            log_print("[SHUTDOWN] Service stopping gracefully.")
+            os._exit(0)
         except Exception as e:
             log_print(f"Polling error: {e}")
-        time.sleep(POLL_INTERVAL)
+        try:
+            time.sleep(POLL_INTERVAL)
+        except KeyboardInterrupt:
+            log_print("[SHUTDOWN] Service stopping gracefully.")
+            os._exit(0)
  
 if __name__=="__main__":
     log_print("="*60)
@@ -898,6 +1062,7 @@ if __name__=="__main__":
     # Detect client info at startup
     log_print("Detecting network information...")
     detect_client_info()
+    push_agent_version()   # Register this PC on /pc_versions dashboard
     
     # Detect OBS streaming data at startup
     log_print("Detecting OBS streaming data...")
@@ -922,6 +1087,16 @@ if __name__=="__main__":
     speed_thread = threading.Thread(target=network_speed_loop, daemon=True)
     speed_thread.start()
 
+    # Start CPU + memory monitoring thread (Task Manager-style: 1 second interval)
+    log_print("Starting real-time CPU and memory monitoring...")
+    stats_thread = threading.Thread(target=system_stats_loop, daemon=True)
+    stats_thread.start()
+
+    # Start GPU monitoring thread (updates every 3 seconds, non-blocking)
+    log_print("Starting real-time GPU monitoring...")
+    gpu_thread = threading.Thread(target=_gpu_monitor_loop, daemon=True)
+    gpu_thread.start()
+
     # Start auto-update thread (checks server for new version every 30 minutes)
     log_print(f"Starting auto-update checker (current build={CLIENT_BUILD}, check interval={UPDATE_CHECK_INTERVAL}s)...")
     update_thread = threading.Thread(target=auto_update_loop, daemon=True)
@@ -932,4 +1107,8 @@ if __name__=="__main__":
     cleanup_thread.start()
 
     log_print("Starting target management loop...")
-    manage_targets_loop()
+    try:
+        manage_targets_loop()
+    except KeyboardInterrupt:
+        log_print("[SHUTDOWN] Service stopping gracefully.")
+        os._exit(0)
