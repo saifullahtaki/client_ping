@@ -5,7 +5,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1025          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1026          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -766,8 +766,10 @@ def _try_install_gputil():
         return False
 
 def _detect_gpu_name():
-    """One-time GPU name detection at startup. Returns name string."""
-    # Method 1: GPUtil (NVIDIA)
+    """One-time GPU name detection at startup. Returns name string.
+    Prefers discrete GPU (NVIDIA/AMD). Skips Intel integrated if a discrete GPU exists.
+    """
+    # Method 1: GPUtil (NVIDIA only — always discrete)
     try:
         import GPUtil
         gpus = GPUtil.getGPUs()
@@ -775,7 +777,7 @@ def _detect_gpu_name():
             return "+".join(g.name.strip() for g in gpus)
     except Exception:
         pass
-    # Method 2: WMI via PowerShell (AMD/Intel/all)
+    # Method 2: WMI via PowerShell (all controllers — filter to discrete)
     try:
         result = subprocess.run(
             ["powershell", "-NoProfile", "-Command",
@@ -785,6 +787,12 @@ def _detect_gpu_name():
         )
         names = [ln.strip() for ln in result.stdout.strip().splitlines() if ln.strip()]
         if names:
+            # Prefer discrete GPUs (NVIDIA / AMD / Radeon) — skip Intel integrated
+            _INTEGRATED = ("intel", "microsoft", "remote desktop", "vmware", "virtualbox", "hyper-v")
+            discrete = [n for n in names if not any(k in n.lower() for k in _INTEGRATED)]
+            if discrete:
+                return "+".join(discrete)
+            # No discrete found — return all (e.g. Intel-only machine)
             return "+".join(names)
     except Exception:
         pass
