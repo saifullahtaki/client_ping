@@ -1,11 +1,11 @@
-import time, requests, subprocess, os, threading, platform, socket, sys, json, shutil
+import time, requests, subprocess, os, threading, platform, socket, sys, json, shutil, math, re
 import logging
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1018          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1025          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -420,8 +420,8 @@ session = requests.Session()
 def parse_ping_windows(output):
     """
     Parse Windows ping output and return RTT in ms.
-    - If RTT < 1ms → return 1.0
-    - If parsing fails → return -10.0 for Grafana
+    - If RTT < 1ms ??? return 1.0
+    - If parsing fails ??? return -10.0 for Grafana
     """
 def parse_ping_windows(output):
     """
@@ -609,7 +609,7 @@ def push_agent_version():
 def check_and_apply_update():
     """
     Check server for a newer build of client_ping.py.
-    If found: download → verify → replace current script → exit.
+    If found: download ??? verify ??? replace current script ??? exit.
     NSSM auto-restarts the service, loading the new code.
     """
     try:
@@ -725,7 +725,7 @@ def network_speed_loop():
                     if recv_delta >= 0:
                         total_recv += recv_delta
 
-            # bytes/s → Mbps  (bits per second / 1,000,000)
+            # bytes/s ??? Mbps  (bits per second / 1,000,000)
             download_mbps = (total_recv * 8) / (1_000_000 * elapsed)
             upload_mbps = (total_sent * 8) / (1_000_000 * elapsed)
 
@@ -794,7 +794,7 @@ def _gpu_monitor_loop():
     """
     Background thread: detects GPU name once, then polls GPU usage every 3 seconds.
     Uses Windows GPU Engine performance counters (all engine types) for accurate
-    GPU usage across NVIDIA/AMD/Intel — including NVENC, VideoDecode, 3D, Compute.
+    GPU usage across NVIDIA/AMD/Intel ??? including NVENC, VideoDecode, 3D, Compute.
     GPUtil is kept only for name detection; NOT used for usage (it misses NVENC).
     Runs separately so slow GPU queries never block the 1-second stats loop.
     """
@@ -877,6 +877,300 @@ def system_stats_loop():
         except Exception as e:
             log_print(f"System stats error: {e}")
             time.sleep(5)
+
+# ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+#  MTR ??? Continuous My TraceRoute engine
+#  Probes each target continuously (one traceroute/sec),
+#  accumulates rolling stats per hop, pushes to InfluxDB every 5s.
+# ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+try:
+    from icmplib import traceroute as _icmp_traceroute
+    _MTR_AVAILABLE = True
+except ImportError:
+    # Auto-install icmplib so clients don't need a manual pip step
+    try:
+        log_print("[MTR] icmplib not found ??? auto-installing...")
+        subprocess.check_call(
+            [sys.executable, '-m', 'pip', 'install', 'icmplib', '-q'],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        from icmplib import traceroute as _icmp_traceroute
+        _MTR_AVAILABLE = True
+        log_print("[MTR] icmplib installed successfully")
+    except Exception as _mtr_install_err:
+        _MTR_AVAILABLE = False
+        log_print(f"[MTR] icmplib unavailable ??? MTR disabled ({_mtr_install_err})")
+
+MTR_PUSH_INTERVAL = 5   # push accumulated stats to server every N seconds
+
+# Shared state  (written by mtr_loop threads, read-only elsewhere)
+_mtr_state   = {}  # target -> {hop_num: _HopState}
+_mtr_lock    = threading.Lock()
+_mtr_threads = {}  # target -> Thread
+_mtr_flags   = {}  # target -> {'stop': bool}
+
+_ptr_cache = {}  # ip -> hostname  (PTR lookup cache, never evicted)
+
+
+class _HopState:
+    """Rolling MTR statistics for one hop ??? same fields as `mtr` output."""
+    __slots__ = ['ip', 'hostname', 'snt', 'rcv',
+                 'last_ms', 'total_ms', 'total_sq_ms', 'min_ms', 'max_ms']
+
+    def __init__(self, ip):
+        self.ip          = ip
+        self.hostname    = ip   # will be overwritten by async PTR lookup
+        self.snt         = 0
+        self.rcv         = 0
+        self.last_ms     = 0.0
+        self.total_ms    = 0.0
+        self.total_sq_ms = 0.0
+        self.min_ms      = float('inf')
+        self.max_ms      = 0.0
+
+    def record_rtt(self, rtt_ms):
+        self.snt         += 1
+        self.rcv         += 1
+        self.last_ms      = round(rtt_ms, 2)
+        self.total_ms    += rtt_ms
+        self.total_sq_ms += rtt_ms * rtt_ms
+        if rtt_ms < self.min_ms: self.min_ms = rtt_ms
+        if rtt_ms > self.max_ms: self.max_ms = rtt_ms
+
+    def record_loss(self):
+        self.snt += 1
+
+    @property
+    def loss_pct(self):
+        return round((self.snt - self.rcv) / self.snt * 100, 1) if self.snt > 0 else 0.0
+
+    @property
+    def avg_ms(self):
+        return round(self.total_ms / self.rcv, 2) if self.rcv > 0 else 0.0
+
+    @property
+    def best_ms(self):
+        return round(self.min_ms, 2) if self.rcv > 0 and self.min_ms != float('inf') else 0.0
+
+    @property
+    def worst_ms(self):
+        return round(self.max_ms, 2) if self.rcv > 0 else 0.0
+
+    @property
+    def stdev_ms(self):
+        if self.rcv < 2:
+            return 0.0
+        mean     = self.total_ms / self.rcv
+        variance = self.total_sq_ms / self.rcv - mean * mean
+        return round(math.sqrt(max(0.0, variance)), 2)
+
+
+def _ptr_lookup_async(hop, ip):
+    """Resolve PTR in a daemon thread, stores result in hop.hostname."""
+    def _run():
+        if ip in _ptr_cache:
+            hop.hostname = _ptr_cache[ip]
+            return
+        try:
+            host = socket.gethostbyaddr(ip)[0]
+        except Exception:
+            host = ip
+        _ptr_cache[ip] = host
+        hop.hostname = host
+    threading.Thread(target=_run, daemon=True).start()
+
+
+_TRACERT_LINE_RE = re.compile(
+    r'^\s*(\d+)'                          # hop number
+    r'(?:\s+(?P<r1><?\d+\s*ms|\*))'       # RTT 1
+    r'(?:\s+(?P<r2><?\d+\s*ms|\*))'       # RTT 2
+    r'(?:\s+(?P<r3><?\d+\s*ms|\*))'       # RTT 3
+    r'\s+(\S+)',                           # IP / first word of "Request timed out."
+    re.IGNORECASE
+)
+_TRACERT_RTT_RE = re.compile(r'<?\s*(\d+)\s*ms', re.IGNORECASE)
+
+
+def _parse_tracert_output(output):
+    """
+    Parse Windows `tracert -d` output into
+    list of (hop_num, ip, avg_rtt_ms, timed_out) tuples.
+    """
+    results = []
+    for line in output.splitlines():
+        m = _TRACERT_LINE_RE.match(line)
+        if not m:
+            continue
+        hop_num  = int(m.group(1))
+        ip_field = m.group(5)   # last capture group = IP or "Request"
+        if ip_field.lower().startswith('request') or ip_field == '*':
+            results.append((hop_num, '*', 0.0, True))
+            continue
+        # collect numeric RTTs from the three RTT groups
+        rtts = []
+        for rtt_str in (m.group('r1'), m.group('r2'), m.group('r3')):
+            rm = _TRACERT_RTT_RE.search(rtt_str or '')
+            if rm:
+                rtts.append(float(rm.group(1)))
+        if rtts:
+            results.append((hop_num, ip_field, sum(rtts) / len(rtts), False))
+        else:
+            results.append((hop_num, ip_field, 0.0, True))
+    return results
+
+
+def _run_mtr_once(target, max_hops=30):
+    """
+    One full MTR probe cycle.
+    On Windows: uses `tracert -d` (reliable intermediate hop support).
+    On Linux/other: falls back to icmplib.
+    Returns list of (hop_num, ip, rtt_ms, timed_out) tuples.
+    """
+    if platform.system() == 'Windows':
+        try:
+            proc = subprocess.run(
+                ['tracert', '-d', '-h', str(max_hops), '-w', '300', target],
+                capture_output=True, text=True, timeout=90,
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
+            results = _parse_tracert_output(proc.stdout)
+            # Strip trailing timed-out hops (*) ??? appear after destination is reached
+            while results and results[-1][3]:  # timed_out == True
+                results.pop()
+            return results
+        except Exception:
+            return []
+    # ?????? Linux / other: use icmplib ??????????????????????????????????????????????????????????????????????????????????????????
+    if not _MTR_AVAILABLE:
+        return []
+    try:
+        hops = _icmp_traceroute(
+            target,
+            count    = 2,
+            interval = 0.05,
+            timeout  = 1.0,
+            max_hops = max_hops,
+            fast     = True,
+        )
+        results = []
+        for h in hops:
+            if h.packets_received > 0:
+                results.append((h.distance, h.address, h.avg_rtt, False))
+            else:
+                results.append((h.distance, '*', 0.0, True))
+        return results
+    except Exception:
+        return []
+
+
+def _push_mtr(target, target_display, hops_snapshot):
+    """POST current hop stats to server /push_mtr (non-blocking)."""
+    try:
+        payload = {
+            "computer_name":  AGENT_NAME,
+            "target":         target,
+            "target_display": target_display,
+            "hops":           hops_snapshot,
+            "timestamp":      int(time.time()),
+            "isp":            client_isp_name,
+            "public_ip":      client_public_ip,
+        }
+        session.post(SERVER_URL.rstrip("/") + "/push_mtr", json=payload, timeout=5)
+    except Exception:
+        pass
+
+
+def mtr_loop(target):
+    """
+    Continuous MTR loop for one target.
+    - Sends one full traceroute ~every second (icmplib with count=1).
+    - Accumulates rolling stats (loss%, avg, best, worst, stdev, snt).
+    - Pushes snapshot to InfluxDB every MTR_PUSH_INTERVAL seconds.
+    - Only active while OBS is running (same gate as ping_loop).
+    """
+    if not _MTR_AVAILABLE:
+        return
+
+    target_display = format_display_name(target, "target")
+    hops       = {}    # hop_num -> _HopState
+    last_push  = 0.0
+
+    while not _mtr_flags.get(target, {}).get('stop', False):
+        # ?????? Gate: pause when OBS not running ??????????????????????????????????????????????????????
+        if not is_obs_running():
+            if hops:                          # clear stale stats
+                hops = {}
+                with _mtr_lock:
+                    _mtr_state[target] = {}
+            time.sleep(5)
+            continue
+
+        # ?????? One MTR probe cycle ????????????????????????????????????????????????????????????????????????????????????????????????
+        results = _run_mtr_once(target)
+        if not results:
+            time.sleep(1)
+            continue
+
+        # ?????? Accumulate stats ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
+        # Remove hops that disappeared (route shortened after trailing-* strip)
+        current_hop_nums = {r[0] for r in results}
+        for stale in [k for k in list(hops.keys()) if k not in current_hop_nums]:
+            del hops[stale]
+
+        for hop_num, ip, rtt_ms, timed_out in results:
+            if hop_num not in hops:
+                hops[hop_num] = _HopState(ip)
+                if ip != '*':
+                    _ptr_lookup_async(hops[hop_num], ip)
+            hop = hops[hop_num]
+
+            # Update IP if routing changes
+            if ip != '*' and ip != hop.ip:
+                hop.ip = ip
+                hop.hostname = ip
+                _ptr_lookup_async(hop, ip)
+
+            if timed_out:
+                hop.record_loss()
+            else:
+                hop.record_rtt(rtt_ms)
+
+        # ?????? Update shared state ????????????????????????????????????????????????????????????????????????????????????????????????
+        with _mtr_lock:
+            _mtr_state[target] = dict(hops)
+
+        # ?????? Push every MTR_PUSH_INTERVAL seconds ?????????????????????????????????????????????
+        now = time.time()
+        if now - last_push >= MTR_PUSH_INTERVAL:
+            last_push = now
+            snapshot = []
+            for hn, s in sorted(hops.items()):
+                snapshot.append({
+                    "hop_num":  hn,
+                    "hop_ip":   s.ip,
+                    "hostname": s.hostname or s.ip,
+                    "loss_pct": s.loss_pct,
+                    "last_ms":  s.last_ms,
+                    "avg_ms":   s.avg_ms,
+                    "best_ms":  s.best_ms,
+                    "worst_ms": s.worst_ms,
+                    "stdev_ms": s.stdev_ms,
+                    "snt":      s.snt,
+                    "rcv":      s.rcv,
+                })
+            threading.Thread(
+                target=_push_mtr,
+                args=(target, target_display, snapshot),
+                daemon=True
+            ).start()
+
+        # tracert (Windows) takes several seconds per cycle; minimal pause only
+        time.sleep(0.5)
+
+    # Thread stopping ??? clean up shared state
+    with _mtr_lock:
+        _mtr_state.pop(target, None)
+
 
 # ---------------- Push ISP info ----------------
 def push_client_info():
@@ -976,7 +1270,7 @@ def manage_targets_loop():
             # Check if OBS is running
             obs_running = is_obs_running()
         except KeyboardInterrupt:
-            log_print("[SHUTDOWN] KeyboardInterrupt received — service stopping.")
+            log_print("[SHUTDOWN] KeyboardInterrupt received ??? service stopping.")
             os._exit(0)
         try:
             # Log OBS status change
@@ -1026,13 +1320,23 @@ def manage_targets_loop():
                 th = threading.Thread(target=ping_loop, args=(t,), daemon=True)
                 threads[t] = th
                 th.start()
-                log_print(f"Started monitoring target: {t}")
+                # MTR thread (silently skipped if icmplib not installed)
+                if _MTR_AVAILABLE:
+                    _mtr_flags[t]   = {'stop': False}
+                    mtr_th = threading.Thread(target=mtr_loop, args=(t,), daemon=True)
+                    _mtr_threads[t] = mtr_th
+                    mtr_th.start()
+                log_print(f"Started monitoring target: {t}" + (" (+ MTR)" if _MTR_AVAILABLE else ""))
            
             # stop removed
             for t in known_targets - new_targets:
                 stop_flags[t]['stop'] = True
                 threads.pop(t, None)
                 stop_flags.pop(t, None)
+                if t in _mtr_flags:
+                    _mtr_flags[t]['stop'] = True
+                    _mtr_threads.pop(t, None)
+                    _mtr_flags.pop(t, None)
                 log_print(f"Stopped monitoring target: {t}")
            
             known_targets = new_targets
