@@ -5,7 +5,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1026          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1030          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -122,6 +122,9 @@ network_upload_mbps = 0.0
 # Global GPU cache (updated every 3 seconds by background thread)
 _gpu_usage = 0.0
 _gpu_name = "unknown"
+
+# On-demand MTR: specific target currently selected in Grafana for this PC (None = off)
+_on_demand_target = None
 
 # Global variables to store OBS streaming data
 obs_icr_code = "unknown"
@@ -1027,6 +1030,28 @@ def _parse_tracert_output(output):
     return results
 
 
+def _poll_mtr_demand():
+    """
+    Background thread: asks server every 15 s which target Grafana has selected
+    for this PC. Sets _on_demand_target so mtr_loop knows which target to run.
+    """
+    global _on_demand_target
+    while True:
+        try:
+            r = session.get(
+                SERVER_URL.rstrip('/') + f'/mtr_check/{AGENT_NAME}',
+                timeout=5
+            )
+            data = r.json()
+            if data.get('active'):
+                _on_demand_target = data.get('target')
+            else:
+                _on_demand_target = None
+        except Exception:
+            pass
+        time.sleep(15)
+
+
 def _run_mtr_once(target, max_hops=30):
     """
     One full MTR probe cycle.
@@ -1100,17 +1125,39 @@ def mtr_loop(target):
         return
 
     target_display = format_display_name(target, "target")
-    hops       = {}    # hop_num -> _HopState
-    last_push  = 0.0
+    hops         = {}    # hop_num -> _HopState
+    last_push    = 0.0
+    demand_start = None  # time when this target was first demanded by Grafana
 
     while not _mtr_flags.get(target, {}).get('stop', False):
-        # ?????? Gate: pause when OBS not running ??????????????????????????????????????????????????????
+        # ── Gate 1: OBS must be running ──────────────────────────────────────────
         if not is_obs_running():
-            if hops:                          # clear stale stats
+            demand_start = None
+            if hops:
                 hops = {}
                 with _mtr_lock:
                     _mtr_state[target] = {}
             time.sleep(5)
+            continue
+
+        # ── Gate 2: only run for the target Grafana currently has selected ───────
+        # Compare using display name because Grafana stores the stripped name (e.g.
+        # "os-origin-server-02" not "os-origin-server-02.udvashunmesh.com")
+        if _on_demand_target != target_display:
+            demand_start = None
+            if hops:
+                hops = {}
+                with _mtr_lock:
+                    _mtr_state[target] = {}
+            time.sleep(5)
+            continue
+
+        # ── Gate 3: 10-second warm-up delay after target is first selected ───────
+        if demand_start is None:
+            demand_start = time.time()
+            log_print(f'[MTR] {target}: selected in Grafana, starting in 10s...')
+        if time.time() - demand_start < 10:
+            time.sleep(1)
             continue
 
         # ?????? One MTR probe cycle ????????????????????????????????????????????????????????????????????????????????????????????????
@@ -1268,11 +1315,24 @@ def ping_loop(target):
         time.sleep(PING_INTERVAL)
  
 # ---------------- Manage Targets ----------------
+def _push_mtr_targets(targets):
+    """Push current known targets to server so Grafana Target dropdown is always populated."""
+    try:
+        payload = {
+            "computer_name": AGENT_NAME,
+            "targets": list(targets),
+        }
+        session.post(SERVER_URL.rstrip("/") + "/push_mtr_targets", json=payload, timeout=5)
+    except Exception:
+        pass
+
+
 def manage_targets_loop():
     known_targets = set()
     last_env_targets = set()
     last_obs_status = None
-    
+    last_targets_push = 0.0
+
     while True:
         try:
             # Check if OBS is running
@@ -1288,21 +1348,24 @@ def manage_targets_loop():
                 else:
                     log_print("OBS not running - stopping all monitoring")
                 last_obs_status = obs_running
-            
+
+            # Always read targets from env/registry (values persist even when OBS closed)
+            current_env_targets = set(get_targets_from_env())
+
+            # Push known targets to server every 60s so Grafana dropdown is always populated
+            if current_env_targets and time.time() - last_targets_push > 60:
+                _push_mtr_targets(current_env_targets)
+                last_targets_push = time.time()
+
             # Only monitor if OBS is running
             if obs_running:
-                # Re-read targets from OBS environment variable (live auto-detect)
-                current_env_targets = set(get_targets_from_env())
-                
-                # Check if OBS environment variable changed
                 if current_env_targets != last_env_targets:
                     if current_env_targets:
                         log_print(f"OBS targets detected: {', '.join(current_env_targets)}")
                     else:
                         log_print("No OBS targets found in environment")
                     last_env_targets = current_env_targets
-                
-                # Start with auto-detected targets from environment variable
+
                 new_targets = current_env_targets.copy()
             else:
                 # OBS not running - no targets to monitor
@@ -1408,6 +1471,11 @@ if __name__=="__main__":
     log_print("Starting real-time GPU monitoring...")
     gpu_thread = threading.Thread(target=_gpu_monitor_loop, daemon=True)
     gpu_thread.start()
+
+    # Start on-demand MTR demand poll (checks if Grafana is viewing this PC)
+    log_print("Starting on-demand MTR demand poller...")
+    mtr_demand_thread = threading.Thread(target=_poll_mtr_demand, daemon=True)
+    mtr_demand_thread.start()
 
     # Start auto-update thread (checks server for new version every 30 minutes)
     log_print(f"Starting auto-update checker (current build={CLIENT_BUILD}, check interval={UPDATE_CHECK_INTERVAL}s)...")
