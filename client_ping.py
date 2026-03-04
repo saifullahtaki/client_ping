@@ -5,7 +5,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1030          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1033          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -1327,6 +1327,15 @@ def _push_mtr_targets(targets):
         pass
 
 
+def _drop_mtr_targets():
+    """Tell server to drop this PC's mtr_targets series so it disappears from Grafana dropdown."""
+    try:
+        session.post(SERVER_URL.rstrip("/") + "/drop_mtr_targets",
+                     json={"computer_name": AGENT_NAME}, timeout=5)
+    except Exception:
+        pass
+
+
 def manage_targets_loop():
     known_targets = set()
     last_env_targets = set()
@@ -1352,8 +1361,9 @@ def manage_targets_loop():
             # Always read targets from env/registry (values persist even when OBS closed)
             current_env_targets = set(get_targets_from_env())
 
-            # Push known targets to server every 60s so Grafana dropdown is always populated
-            if current_env_targets and time.time() - last_targets_push > 60:
+            # Push known targets ONLY when OBS is running (every 30s)
+            # This keeps mtr_targets fresh so Grafana dropdown shows only active PCs
+            if obs_running and current_env_targets and time.time() - last_targets_push > 30:
                 _push_mtr_targets(current_env_targets)
                 last_targets_push = time.time()
 
@@ -1373,6 +1383,8 @@ def manage_targets_loop():
                 if last_env_targets:
                     log_print("Clearing all targets - OBS is closed")
                     last_env_targets = set()
+                    last_targets_push = 0.0
+                    _drop_mtr_targets()  # remove from Grafana dropdown immediately
            
             # Also fetch targets from server (if any) - only if OBS is running
             if obs_running:
