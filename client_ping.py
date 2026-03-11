@@ -5,7 +5,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1033          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1034          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -1361,12 +1361,6 @@ def manage_targets_loop():
             # Always read targets from env/registry (values persist even when OBS closed)
             current_env_targets = set(get_targets_from_env())
 
-            # Push known targets ONLY when OBS is running (every 30s)
-            # This keeps mtr_targets fresh so Grafana dropdown shows only active PCs
-            if obs_running and current_env_targets and time.time() - last_targets_push > 30:
-                _push_mtr_targets(current_env_targets)
-                last_targets_push = time.time()
-
             # Only monitor if OBS is running
             if obs_running:
                 if current_env_targets != last_env_targets:
@@ -1396,6 +1390,12 @@ def manage_targets_loop():
                         new_targets.update(server_targets)
                 except:
                     pass  # If server is unreachable, still use auto-detected targets
+
+            # Push ALL known targets (env + server) when OBS is running (every 30s)
+            # Done after server targets are fetched so mtr_targets includes all active targets
+            if obs_running and new_targets and time.time() - last_targets_push > 30:
+                _push_mtr_targets(new_targets)
+                last_targets_push = time.time()
            
             # start new
             for t in new_targets - known_targets:
