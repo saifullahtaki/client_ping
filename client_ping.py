@@ -5,7 +5,7 @@ from datetime import datetime
 import psutil
 
 # --------------- Version (Auto-Update) ---------------
-CLIENT_BUILD = 1034          # Increment this each time you deploy a new version
+CLIENT_BUILD = 1036          # Increment this each time you deploy a new version
 UPDATE_CHECK_INTERVAL = 20 # Check for updates every hour
 
 # Get absolute path of script directory
@@ -131,6 +131,7 @@ obs_icr_code = "unknown"
 obs_stream_title = "unknown"
 obs_stream_preview_ostream = "unknown"
 obs_stream_preview_youtube = "unknown"
+obs_plugin_version = "unknown"
 
 # Setup logging for service mode
 LOG_DIR = os.path.join(SCRIPT_DIR, "logs")
@@ -245,9 +246,12 @@ def get_local_ip():
 
 def detect_obs_streaming_data():
     """Detect OBS streaming data from registry/environment variables."""
-    global obs_icr_code, obs_stream_title, obs_stream_preview_ostream, obs_stream_preview_youtube
+    global obs_icr_code, obs_stream_title, obs_stream_preview_ostream, obs_stream_preview_youtube, obs_plugin_version
     
     try:
+        # Get OBS Plugin Version
+        obs_plugin_version = get_env_from_registry("OBS_PLUGIN_VERSION", "unknown")
+        
         # Get OBS ICR Code
         obs_icr_code = get_env_from_registry("OBS_ICR_CODE", "unknown")
         
@@ -283,7 +287,7 @@ def detect_obs_streaming_data():
                     elif obs_stream_preview_youtube == "unknown":
                         obs_stream_preview_youtube = url
         
-        log_print(f"OBS Streaming Data Detected: ICR Code={obs_icr_code}, Title={obs_stream_title}")
+        log_print(f"OBS Streaming Data Detected: Plugin Version={obs_plugin_version}, ICR Code={obs_icr_code}, Title={obs_stream_title}")
         log_print(f"  Preview URLs - OStream={obs_stream_preview_ostream}, YouTube={obs_stream_preview_youtube}")
         return True
     except Exception as e:
@@ -582,6 +586,7 @@ def send_ping(target, rtt, success, raw):
         "isp_display": isp_display,  # Shortened ISP display name
         "preview_ostream": obs_stream_preview_ostream,  # OBS OStream preview URL
         "preview_youtube": obs_stream_preview_youtube,  # OBS YouTube preview URL
+        "obs_plugin_version": obs_plugin_version,  # OBS plugin version
         "timestamp": int(time.time()),
         "success": success,
         "rtt_ms": rtt,
@@ -1277,6 +1282,7 @@ def push_client_info():
             "obs_stream_title": obs_stream_title if obs_running else "unknown",
             "obs_stream_preview_ostream": obs_stream_preview_ostream if obs_running else "unknown",
             "obs_stream_preview_youtube": obs_stream_preview_youtube if obs_running else "unknown",
+            "obs_plugin_version": obs_plugin_version if obs_running else "unknown",
             "os_origin_server": os_origin_server,
             "os_origin_ping": os_origin_ping,
             "youtube_server": youtube_server,
